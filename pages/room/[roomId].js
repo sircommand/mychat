@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-const SIGNALING_URL = "wss://representative-katie-evaluate-scores.trycloudflare.com";
+const SIGNALING_URL = "wss://pci-quilt-catherine-illinois.trycloudflare.com";
 
 export default function RoomPage({ roomId }) {
   const localVideo = useRef(null);
