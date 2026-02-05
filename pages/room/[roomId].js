@@ -9,44 +9,36 @@ export default function RoomPage({ roomId }) {
   const [chat, setChat] = useState([]);
   const [message, setMessage] = useState("");
   const wsRef = useRef(null);
-  const [userId, setUserId] = useState(null);
-  // peersInfo: { [peerId]: { pc, streamIndex } }
+  const userIdRef = useRef(null); // فقط مقدار قطعی userId واقعی کاربر را نگه می‌دارد
   const peersInfo = useRef({});
+
+  // helper
+  function findEmptyRemoteIndex() {
+    for (let i = 1; i <= 2; ++i)
+      if (!streams[i]) return i;
+    return null;
+  }
+  function addRemoteStream(peerId, stream) {
+    setStreams(prev => {
+      const remoteIndex = findEmptyRemoteIndex();
+      if (remoteIndex) {
+        const newStreams = [...prev];
+        newStreams[remoteIndex] = stream;
+        peersInfo.current[peerId].streamIndex = remoteIndex;
+        return newStreams;
+      }
+      return prev;
+    });
+  }
 
   useEffect(() => {
     let localStream;
-    let myUserId;
-
-    // Helper: find the first empty box [1] or [2] for remote
-    function findEmptyRemoteIndex() {
-      for (let i = 1; i <= 2; ++i)
-        if (!streams[i]) return i;
-      return null;
-    }
-
-    // Add remote track (video+audio)
-    function addRemoteStream(peerId, stream) {
-      setStreams(prev => {
-        // Don't change local stream [0]
-        const remoteIndex = findEmptyRemoteIndex();
-        if (remoteIndex) {
-          const newStreams = [...prev];
-          newStreams[remoteIndex] = stream;
-          // Assign streamIndex for this peer
-          peersInfo.current[peerId].streamIndex = remoteIndex;
-          return newStreams;
-        }
-        return prev;
-      });
-    }
 
     async function init() {
-      // step1: get local cam
       localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setStreams(s => [localStream, null, null]);
       if (localVideo.current) localVideo.current.srcObject = localStream;
 
-      // step2: connect signaling server
       const ws = new window.WebSocket(SIGNALING_URL);
       wsRef.current = ws;
 
@@ -57,22 +49,20 @@ export default function RoomPage({ roomId }) {
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
 
+        // 1- دریافت userId واقعی
+        if (msg.action === "your_id") {
+          userIdRef.current = msg.userId;
+          return;
+        }
+
+        // 2- دریافت peers فعلی و ساختن PeerConnection
         if (msg.action === "peers") {
-          if (!userId && wsRef.current && wsRef.current.url) {
-            // Find yourself: when peers update, you are the one not present previously
-            if (!myUserId) {
-              // Try to find by elimination
-              let others = Object.keys(peersInfo.current);
-              myUserId = msg.peers.find(p => !others.includes(p));
-              setUserId(myUserId);
-            }
-          }
-          // Remove closed peers
+          if (!userIdRef.current) return; // صبر کن تا userId دقیقا ست شود!
+
+          // حذف peers بسته‌شده
           Object.keys(peersInfo.current).forEach(peerId => {
             if (!msg.peers.includes(peerId)) {
-              if (peersInfo.current[peerId].pc) {
-                peersInfo.current[peerId].pc.close();
-              }
+              if (peersInfo.current[peerId].pc) peersInfo.current[peerId].pc.close();
               setStreams(prev => {
                 const ind = peersInfo.current[peerId].streamIndex || 1;
                 const newStreams = [...prev];
@@ -82,47 +72,43 @@ export default function RoomPage({ roomId }) {
               delete peersInfo.current[peerId];
             }
           });
-          // Create PeerConnections for new peers
+
+          // ایجاد PeerConnection برای هر peer جدید
           msg.peers.forEach(peerId => {
-            if (peerId !== myUserId && !peersInfo.current[peerId]) {
-              // Make a new peer connection
+            if (peerId !== userIdRef.current && !peersInfo.current[peerId]) {
               const pc = new RTCPeerConnection();
-              // Send ICE candidates
               pc.onicecandidate = event => {
                 if (event.candidate) {
                   ws.send(JSON.stringify({
                     action: "signal",
                     target: peerId,
-                    from: myUserId,
+                    from: userIdRef.current,
                     type: "candidate",
                     candidate: event.candidate,
                   }));
                 }
               };
-              // Incoming streams
               pc.ontrack = (event) => {
                 if (!peersInfo.current[peerId].stream) {
-                  // new remote stream
                   peersInfo.current[peerId].stream = event.streams[0];
                   addRemoteStream(peerId, event.streams[0]);
                   if (peersInfo.current[peerId].streamIndex) {
-                    // Update video element
                     if (remoteVideoRefs[peersInfo.current[peerId].streamIndex - 1].current)
                       remoteVideoRefs[peersInfo.current[peerId].streamIndex - 1].current.srcObject = event.streams[0];
                   }
                 }
               };
-              // لوکال ترک ها رو به هر peer connection attach کن
               localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
               peersInfo.current[peerId] = { pc };
-              // Initiator: سمتی که userId بزرگتر داره، offer می‌سازد (جلوگیری از دو offer همزمان)
-              if (!myUserId || (myUserId > peerId)) {
+
+              // فقط اگر userId تو بزرگ‌تر از peer است (خودت offer باشی)
+              if (userIdRef.current > peerId) {
                 pc.createOffer().then(offer => {
                   pc.setLocalDescription(offer);
                   ws.send(JSON.stringify({
                     action: "signal",
                     target: peerId,
-                    from: myUserId,
+                    from: userIdRef.current,
                     type: "offer",
                     sdp: offer,
                   }));
@@ -131,22 +117,19 @@ export default function RoomPage({ roomId }) {
             }
           });
         }
+        // 3- سیگنالینگ با peer
         else if (msg.action === "signal") {
-          if (!myUserId) {
-            myUserId = msg.target;
-            setUserId(myUserId);
-          }
+          if (!userIdRef.current) return;
           let peerId = msg.from;
-          let isOfferer = false;
           if (!peersInfo.current[peerId]) {
-            // Make RTCPeerConnection if not exist
+            // ایجاد connection درصورت نیاز (چون شاید جواب offer باشی)
             const pc = new RTCPeerConnection();
             pc.onicecandidate = event => {
               if (event.candidate) {
                 ws.send(JSON.stringify({
                   action: "signal",
                   target: peerId,
-                  from: myUserId,
+                  from: userIdRef.current,
                   type: "candidate",
                   candidate: event.candidate,
                 }));
@@ -162,10 +145,8 @@ export default function RoomPage({ roomId }) {
                 }
               }
             };
-            // Attach local tracks
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
             peersInfo.current[peerId] = { pc };
-            isOfferer = true;
           }
           const pc = peersInfo.current[peerId].pc;
 
@@ -176,7 +157,7 @@ export default function RoomPage({ roomId }) {
             ws.send(JSON.stringify({
               action: "signal",
               target: peerId,
-              from: myUserId,
+              from: userIdRef.current,
               type: "answer",
               sdp: answer,
             }));
@@ -190,6 +171,7 @@ export default function RoomPage({ roomId }) {
             } catch (e) {}
           }
         }
+        // مدیریت باقی پیام‌ها
         else if (msg.action === "force_leave") {
           alert("اتاق پر است");
           window.location = "/";
@@ -209,13 +191,12 @@ export default function RoomPage({ roomId }) {
     // eslint-disable-next-line
   }, [roomId]);
 
-  // When remote streams change, update refs
+  // رفرش stream‌ها در refs
   useEffect(() => {
     for (let i = 1; i <= 2; ++i) {
       if (streams[i] && remoteVideoRefs[i-1].current)
         remoteVideoRefs[i-1].current.srcObject = streams[i];
     }
-    // eslint-disable-next-line
   }, [streams]);
 
   return (
@@ -235,14 +216,14 @@ export default function RoomPage({ roomId }) {
           <input value={message} onChange={e=>setMessage(e.target.value)} style={{flex: 1}} />
           <button onClick={() => {
             if (wsRef.current && message) {
-              wsRef.current.send(JSON.stringify({ action: "chat", text: message, from: userId }));
+              wsRef.current.send(JSON.stringify({ action: "chat", text: message, from: userIdRef.current }));
               setMessage("");
             }
           }}>ارسال</button>
         </div>
       </div>
     </div>
-  )
+  );
 }
 
 RoomPage.getInitialProps = async ({ query }) => ({ roomId: query.roomId });
